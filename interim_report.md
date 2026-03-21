@@ -11,7 +11,7 @@ Prepared for interim submission.
 Callback tracing is Event-Driven Architecture (EDA), not Event Sourcing (ES).
 
 - In EDA, event-like records are notifications and can be dropped without losing system-of-record state.
-- In ES, events are the system-of-record itself. If events are lost, state reconstruction is broken.
+- In ES, events are the permanent system-of-record and cannot be lost without breaking state reconstruction.
 
 #### Redesign from callbacks to The Ledger
 
@@ -54,7 +54,7 @@ Scenario: two agents read version 3 and both append with `expected_version=3`.
 
 1. Both readers observe stream version 3.
 2. Both invoke append concurrently.
-3. Writer A acquires DB row lock (`SELECT ... FOR UPDATE`) and validates version 3.
+3. Writer A executes `SELECT current_version FROM event_streams WHERE stream_id = ? FOR UPDATE`, acquires the row lock, and validates version 3.
 4. Writer A appends event, advances stream to version 4, commits.
 5. Writer B resumes, now sees current version 4.
 6. Expected 3 vs actual 4 mismatch triggers `OptimisticConcurrencyError`.
@@ -151,36 +151,10 @@ Recovery path:
 
 ![Architecture Diagram](assets/mermaid-diagram-2026-03-22-010058.png)
 
-```mermaid
-flowchart LR
-    C["Command Input\nCreditAnalysisCompletedCommand"];
-    H["Command Handler\nload -> validate -> determine -> append"];
-    R["Aggregate Replay\nloan stream replay"];
-    TX["Append Transaction\nOCC expected version check"];
-    E[("events table")];
-    O[("outbox table")];
-
-    subgraph B1["Aggregate Boundaries"]
-        A["LoanApplication Aggregate\nstream loan application id"];
-        S["AgentSession Aggregate\nstream agent type session id"];
-        C2["ComplianceRecord Aggregate\nstream compliance application id"];
-    end
-
-    C -->|"1 route command"| H;
-    H -->|"2a replay loan stream"| R;
-    R -->|"2b hydrate state"| A;
-    H -->|"2c replay session stream"| S;
-    A -->|"3a guard validation"| H;
-    S -->|"3b guard validation"| H;
-    H -->|"4 construct typed events"| TX;
-    TX -->|"5a same transaction write"| E;
-    TX -->|"5b same transaction write"| O;
-```
-
-Mermaid Live export note:
-1. Paste this block into https://mermaid.live/.
-2. Use Actions -> Download PNG.
-3. Save as architecture_diagram.png and insert it into the report before PDF export.
+Diagram stream boundaries represented:
+1. `loan-{application_id}`
+2. `agent-{agent_type}-{session_id}`
+3. `compliance-{application_id}`
 
 Single-event trace from command to persistence:
 1. Command enters handler.
