@@ -45,15 +45,10 @@ class AgentSessionAggregate:
     # ─── EVENT HANDLERS ───────────────────────────────────────────────────────
     
     def _on_AgentSessionStarted(self, event: StoredEvent) -> None:
-        self._context_declared = True
-        
         payload = event.payload
-        # handle dict or dot-notation if deserialized
         if isinstance(payload, dict):
-            self._model_version = payload.get("model_version")
             self._agent_type = payload.get("agent_type")
         else:
-            self._model_version = getattr(payload, "model_version", None)
             self._agent_type = getattr(payload, "agent_type", None)
 
     def _on_AgentContextLoaded(self, event: StoredEvent) -> None:
@@ -62,10 +57,10 @@ class AgentSessionAggregate:
 
         payload = event.payload
         if isinstance(payload, dict):
-            self._model_version = payload.get("model_version", self._model_version)
+            self._model_version = payload.get("model_version")
             self._agent_type = payload.get("agent_type", self._agent_type)
         else:
-            self._model_version = getattr(payload, "model_version", self._model_version)
+            self._model_version = getattr(payload, "model_version", None)
             self._agent_type = getattr(payload, "agent_type", self._agent_type)
 
     def _on_AgentNodeExecuted(self, event: StoredEvent) -> None:
