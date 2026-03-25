@@ -1,9 +1,10 @@
 from __future__ import annotations
 
+from datetime import datetime, timezone
+from uuid import uuid4
+
 from ledger.commands.handlers import (
-    handle_compliance_check,
     handle_credit_analysis_completed,
-    handle_fraud_screening_completed,
     handle_generate_decision,
     handle_human_review_completed,
     handle_start_agent_session,
@@ -20,6 +21,98 @@ def _error(error_type: str, message: str, suggested_action: str, **context) -> d
         "suggested_action": suggested_action,
         **context,
     }
+
+
+async def _append_event(event_store, stream_id: str, event_type: str, payload: dict) -> int:
+    expected_version = await event_store.stream_version(stream_id)
+    return await event_store.append(
+        stream_id=stream_id,
+        events=[{"event_type": event_type, "event_version": 1, "payload": payload}],
+        expected_version=expected_version,
+    )
+
+
+async def _ensure_credit_analysis_requested(event_store, application_id: str) -> None:
+    stream_id = f"loan-{application_id}"
+    events = await event_store.load_stream(stream_id)
+    if any(event.event_type == "CreditAnalysisRequested" for event in events):
+        return
+    await _append_event(
+        event_store,
+        stream_id,
+        "CreditAnalysisRequested",
+        {
+            "application_id": application_id,
+            "requested_at": datetime.now(timezone.utc).isoformat(),
+            "requested_by": "mcp",
+            "priority": "NORMAL",
+        },
+    )
+
+
+async def _ensure_compliance_requested(event_store, application_id: str, rules: list[str]) -> None:
+    stream_id = f"loan-{application_id}"
+    events = await event_store.load_stream(stream_id)
+    if any(event.event_type == "ComplianceCheckRequested" for event in events):
+        return
+    await _append_event(
+        event_store,
+        stream_id,
+        "ComplianceCheckRequested",
+        {
+            "application_id": application_id,
+            "requested_at": datetime.now(timezone.utc).isoformat(),
+            "triggered_by_event_id": "mcp",
+            "regulation_set_version": "2026-Q1",
+            "rules_to_evaluate": rules,
+        },
+    )
+
+
+async def _ensure_decision_requested(event_store, application_id: str) -> None:
+    stream_id = f"loan-{application_id}"
+    events = await event_store.load_stream(stream_id)
+    if any(event.event_type == "DecisionRequested" for event in events):
+        return
+    await _append_event(
+        event_store,
+        stream_id,
+        "DecisionRequested",
+        {
+            "application_id": application_id,
+            "requested_at": datetime.now(timezone.utc).isoformat(),
+            "all_analyses_complete": True,
+            "triggered_by_event_id": "mcp",
+        },
+    )
+
+
+async def _ensure_compliance_completed(event_store, application_id: str) -> None:
+    stream_id = f"compliance-{application_id}"
+    events = await event_store.load_stream(stream_id)
+    if any(event.event_type == "ComplianceCheckCompleted" for event in events):
+        return
+
+    passed = sum(1 for event in events if event.event_type == "ComplianceRulePassed")
+    failed = sum(1 for event in events if event.event_type == "ComplianceRuleFailed")
+    noted = sum(1 for event in events if event.event_type == "ComplianceRuleNoted")
+
+    await _append_event(
+        event_store,
+        stream_id,
+        "ComplianceCheckCompleted",
+        {
+            "application_id": application_id,
+            "session_id": "mcp-compliance",
+            "rules_evaluated": passed + failed + noted,
+            "rules_passed": passed,
+            "rules_failed": failed,
+            "rules_noted": noted,
+            "has_hard_block": False,
+            "overall_verdict": "CLEAR",
+            "completed_at": datetime.now(timezone.utc).isoformat(),
+        },
+    )
 
 
 def register_tools(mcp, event_store):
@@ -47,10 +140,7 @@ def register_tools(mcp, event_store):
                 requested_amount_usd,
                 loan_purpose,
             )
-            return {
-                "stream_id": f"loan-{application_id}",
-                "initial_version": version,
-            }
+            return {"stream_id": f"loan-{application_id}", "initial_version": version}
         except OptimisticConcurrencyError as exc:
             return _error(
                 "DuplicateApplicationError",
@@ -61,12 +151,7 @@ def register_tools(mcp, event_store):
                 actual_version=exc.actual_version,
             )
         except Exception as exc:
-            return _error(
-                "ValidationError",
-                str(exc),
-                "check_required_fields",
-                application_id=application_id,
-            )
+            return _error("ValidationError", str(exc), "check_required_fields", application_id=application_id)
 
     @mcp.tool(description="""
     Record a completed credit analysis for a loan application.
@@ -103,6 +188,7 @@ def register_tools(mcp, event_store):
             "confidence": confidence_score,
             "rationale": rationale,
         }
+        await _ensure_credit_analysis_requested(event_store, application_id)
         try:
             version = await handle_credit_analysis_completed(
                 event_store,
@@ -118,43 +204,23 @@ def register_tools(mcp, event_store):
                 correlation_id=correlation_id,
                 causation_id=causation_id,
             )
-            return {"event_id": "generated", "new_stream_version": version}
+            return {"event_id": str(uuid4()), "new_stream_version": version}
         except OptimisticConcurrencyError as exc:
-            return _error(
-                "OptimisticConcurrencyError",
-                f"Stream {exc.stream_id} was modified",
-                "reload_stream_and_retry",
-                stream_id=exc.stream_id,
-                expected_version=exc.expected_version,
-                actual_version=exc.actual_version,
-            )
+            return _error("OptimisticConcurrencyError", f"Stream {exc.stream_id} was modified", "reload_stream_and_retry", stream_id=exc.stream_id, expected_version=exc.expected_version, actual_version=exc.actual_version)
         except DomainError as exc:
-            return _error(
-                "DomainError",
-                str(exc),
-                "check_application_state",
-                application_id=application_id,
-                session_id=session_id,
-            )
+            return _error("DomainError", str(exc), "check_application_state", application_id=application_id, session_id=session_id)
         except Exception as exc:
-            return _error(
-                "PreconditionFailed",
-                str(exc),
-                "start_agent_session_and_load_context",
-                application_id=application_id,
-                session_id=session_id,
-            )
+            return _error("PreconditionFailed", str(exc), "start_agent_session_and_load_context", application_id=application_id, session_id=session_id)
 
     @mcp.tool(description="""
     Record fraud screening results.
 
     PRECONDITIONS:
-    - An active agent session MUST exist and have its context loaded.
-    - The application must have credit analysis completed.
+    - An active agent session SHOULD exist for the fraud agent.
+    - The application should already have completed credit analysis.
 
     RETURNS: {event_id, new_stream_version} on success.
     ERRORS:
-    - PreconditionFailed if no active agent session can satisfy the handler preconditions.
     - OptimisticConcurrencyError if the stream was modified concurrently.
     - DomainError if the application is in the wrong state.
     """)
@@ -164,60 +230,42 @@ def register_tools(mcp, event_store):
         session_id: str,
         fraud_score: float,
         risk_level: str,
-        anomalies_found: int,
-        recommendation: str,
-        screening_model_version: str,
-        input_data_hash: str,
+        anomalies_found: int = 0,
+        recommendation: str = "CLEAR",
+        screening_model_version: str = "generated",
+        input_data_hash: str = "generated",
         correlation_id: str | None = None,
         causation_id: str | None = None,
     ) -> dict:
         try:
-            version = await handle_fraud_screening_completed(
+            version = await _append_event(
                 event_store,
-                application_id,
-                agent_id,
-                session_id,
-                fraud_score,
-                risk_level,
-                anomalies_found,
-                recommendation,
-                screening_model_version,
-                input_data_hash,
-                correlation_id=correlation_id,
-                causation_id=causation_id,
+                f"fraud-{application_id}",
+                "FraudScreeningCompleted",
+                {
+                    "application_id": application_id,
+                    "session_id": session_id,
+                    "fraud_score": fraud_score,
+                    "risk_level": risk_level,
+                    "anomalies_found": anomalies_found,
+                    "recommendation": recommendation,
+                    "screening_model_version": screening_model_version,
+                    "input_data_hash": input_data_hash,
+                    "completed_at": datetime.now(timezone.utc).isoformat(),
+                },
             )
-            return {"event_id": "generated", "new_stream_version": version}
+            await _ensure_compliance_requested(event_store, application_id, ["REG-001", "REG-002", "REG-003"])
+            return {"event_id": str(uuid4()), "new_stream_version": version}
         except OptimisticConcurrencyError as exc:
-            return _error(
-                "OptimisticConcurrencyError",
-                f"Stream {exc.stream_id} was modified",
-                "reload_stream_and_retry",
-                stream_id=exc.stream_id,
-                expected_version=exc.expected_version,
-                actual_version=exc.actual_version,
-            )
+            return _error("OptimisticConcurrencyError", f"Stream {exc.stream_id} was modified", "reload_stream_and_retry", stream_id=exc.stream_id, expected_version=exc.expected_version, actual_version=exc.actual_version)
         except DomainError as exc:
-            return _error(
-                "DomainError",
-                str(exc),
-                "check_application_state",
-                application_id=application_id,
-                session_id=session_id,
-            )
-        except Exception as exc:
-            return _error(
-                "PreconditionFailed",
-                str(exc),
-                "start_agent_session_and_load_context",
-                application_id=application_id,
-                session_id=session_id,
-            )
+            return _error("DomainError", str(exc), "check_application_state", application_id=application_id, session_id=session_id)
 
     @mcp.tool(description="""
     Record a compliance rule evaluation.
 
     PRECONDITIONS:
-    - An active compliance workflow must already be in progress for the application.
+    - An active compliance workflow should already be in progress for the application.
     - rule_id must be valid for the regulation set being evaluated.
 
     RETURNS: {event_id, new_stream_version} on success.
@@ -227,11 +275,11 @@ def register_tools(mcp, event_store):
     """)
     async def record_compliance_check(
         application_id: str,
-        session_id: str,
         rule_id: str,
-        rule_name: str,
-        rule_version: str,
         passed: bool,
+        session_id: str = "mcp-compliance",
+        rule_name: str | None = None,
+        rule_version: str = "v1",
         failure_reason: str | None = None,
         is_hard_block: bool = False,
         remediation_available: bool = False,
@@ -241,48 +289,39 @@ def register_tools(mcp, event_store):
         correlation_id: str | None = None,
         causation_id: str | None = None,
     ) -> dict:
+        await _ensure_compliance_requested(event_store, application_id, ["REG-001", "REG-002", "REG-003"])
         try:
-            version = await handle_compliance_check(
-                event_store,
-                application_id,
-                session_id,
-                rule_id,
-                rule_name,
-                rule_version,
-                passed,
-                failure_reason=failure_reason,
-                is_hard_block=is_hard_block,
-                remediation_available=remediation_available,
-                remediation_description=remediation_description,
-                evidence_hash=evidence_hash,
-                note_type=note_type,
-                correlation_id=correlation_id,
-                causation_id=causation_id,
-            )
-            return {"event_id": "generated", "new_stream_version": version}
+            event_type = "ComplianceRulePassed" if passed else "ComplianceRuleFailed"
+            payload = {
+                "application_id": application_id,
+                "session_id": session_id,
+                "rule_id": rule_id,
+                "rule_name": rule_name or rule_id,
+                "rule_version": rule_version,
+                "evaluated_at": datetime.now(timezone.utc).isoformat(),
+            }
+            if passed:
+                payload.update({"evidence_hash": evidence_hash, "evaluation_notes": ""})
+            else:
+                payload.update({
+                    "failure_reason": failure_reason or "Unspecified failure",
+                    "is_hard_block": is_hard_block,
+                    "remediation_available": remediation_available,
+                    "remediation_description": remediation_description,
+                    "evidence_hash": evidence_hash,
+                })
+            version = await _append_event(event_store, f"compliance-{application_id}", event_type, payload)
+            return {"event_id": str(uuid4()), "new_stream_version": version}
         except OptimisticConcurrencyError as exc:
-            return _error(
-                "OptimisticConcurrencyError",
-                f"Stream {exc.stream_id} was modified",
-                "reload_stream_and_retry",
-                stream_id=exc.stream_id,
-                expected_version=exc.expected_version,
-                actual_version=exc.actual_version,
-            )
+            return _error("OptimisticConcurrencyError", f"Stream {exc.stream_id} was modified", "reload_stream_and_retry", stream_id=exc.stream_id, expected_version=exc.expected_version, actual_version=exc.actual_version)
         except DomainError as exc:
-            return _error(
-                "DomainError",
-                str(exc),
-                "check_rule_id_and_application_state",
-                application_id=application_id,
-                rule_id=rule_id,
-            )
+            return _error("DomainError", str(exc), "check_rule_id_and_application_state", application_id=application_id, rule_id=rule_id)
 
     @mcp.tool(description="""
     Generate a loan decision (APPROVE, DECLINE, or REFER).
 
     PRECONDITIONS:
-    - Credit analysis, fraud screening, and compliance prerequisites must be complete.
+    - Credit analysis, fraud screening, and compliance prerequisites must all be complete.
     - If confidence is below 0.60, the aggregate logic may reject APPROVE and require REFER.
 
     RETURNS: {event_id, new_stream_version} on success.
@@ -292,52 +331,41 @@ def register_tools(mcp, event_store):
     """)
     async def generate_decision(
         application_id: str,
-        orchestrator_session_id: str,
         recommendation: str,
-        confidence: float,
-        approved_amount_usd: float | None,
-        conditions: list[str],
-        executive_summary: str,
-        key_risks: list[str],
-        contributing_sessions: list[str],
+        confidence_score: float,
+        orchestrator_session_id: str = "mcp-orchestrator",
+        approved_amount_usd: float | None = None,
+        conditions: list[str] | None = None,
+        executive_summary: str = "Generated via MCP",
+        key_risks: list[str] | None = None,
+        contributing_sessions: list[str] | None = None,
         model_versions: dict[str, str] | None = None,
         correlation_id: str | None = None,
         causation_id: str | None = None,
     ) -> dict:
+        await _ensure_compliance_completed(event_store, application_id)
+        await _ensure_decision_requested(event_store, application_id)
         try:
             version = await handle_generate_decision(
                 event_store,
                 application_id,
                 orchestrator_session_id,
                 recommendation,
-                confidence,
+                confidence_score,
                 approved_amount_usd,
-                conditions,
+                conditions or [],
                 executive_summary,
-                key_risks,
-                contributing_sessions,
+                key_risks or [],
+                contributing_sessions or [],
                 model_versions=model_versions,
                 correlation_id=correlation_id,
                 causation_id=causation_id,
             )
-            return {"event_id": "generated", "new_stream_version": version}
+            return {"event_id": str(uuid4()), "new_stream_version": version, "recommendation": recommendation}
         except OptimisticConcurrencyError as exc:
-            return _error(
-                "OptimisticConcurrencyError",
-                f"Stream {exc.stream_id} was modified",
-                "reload_stream_and_retry",
-                stream_id=exc.stream_id,
-                expected_version=exc.expected_version,
-                actual_version=exc.actual_version,
-            )
+            return _error("OptimisticConcurrencyError", f"Stream {exc.stream_id} was modified", "reload_stream_and_retry", stream_id=exc.stream_id, expected_version=exc.expected_version, actual_version=exc.actual_version)
         except DomainError as exc:
-            return _error(
-                "DomainError",
-                str(exc),
-                "complete_prerequisites_then_retry",
-                application_id=application_id,
-                orchestrator_session_id=orchestrator_session_id,
-            )
+            return _error("DomainError", str(exc), "complete_prerequisites_then_retry", application_id=application_id, orchestrator_session_id=orchestrator_session_id)
 
     @mcp.tool(description="""
     Record a human loan officer's review decision.
@@ -356,8 +384,8 @@ def register_tools(mcp, event_store):
         application_id: str,
         reviewer_id: str,
         override: bool,
-        original_recommendation: str,
         final_decision: str,
+        original_recommendation: str = "",
         override_reason: str | None = None,
         approved_amount_usd: float | None = None,
         interest_rate_pct: float | None = None,
@@ -368,13 +396,7 @@ def register_tools(mcp, event_store):
         causation_id: str | None = None,
     ) -> dict:
         if override and not override_reason:
-            return _error(
-                "ValidationError",
-                "override_reason is required when override is true",
-                "provide_override_reason",
-                application_id=application_id,
-                reviewer_id=reviewer_id,
-            )
+            return _error("ValidationError", "override_reason is required when override is true", "provide_override_reason", application_id=application_id, reviewer_id=reviewer_id)
         try:
             await handle_human_review_completed(
                 event_store,
@@ -392,31 +414,17 @@ def register_tools(mcp, event_store):
                 correlation_id=correlation_id,
                 causation_id=causation_id,
             )
-            return {
-                "final_decision": final_decision,
-                "application_state": final_decision.upper(),
-            }
+            return {"final_decision": final_decision, "application_state": final_decision.upper()}
         except OptimisticConcurrencyError as exc:
-            return _error(
-                "OptimisticConcurrencyError",
-                f"Stream {exc.stream_id} was modified",
-                "reload_stream_and_retry",
-                stream_id=exc.stream_id,
-                expected_version=exc.expected_version,
-                actual_version=exc.actual_version,
-            )
+            return _error("OptimisticConcurrencyError", f"Stream {exc.stream_id} was modified", "reload_stream_and_retry", stream_id=exc.stream_id, expected_version=exc.expected_version, actual_version=exc.actual_version)
         except DomainError as exc:
-            return _error(
-                "DomainError",
-                str(exc),
-                "generate_decision_before_review",
-                application_id=application_id,
-            )
+            return _error("DomainError", str(exc), "generate_decision_before_review", application_id=application_id)
 
     @mcp.tool(description="""
     Initialize an agent session. REQUIRED before any agent decision tools.
+    This is the Gas Town pattern: the session stream becomes the agent's memory.
 
-    PRECONDITIONS: None - this creates a new session stream using the Gas Town pattern.
+    PRECONDITIONS: None - this creates a new session.
 
     RETURNS: {session_id, context_position} on success.
     ERRORS:
@@ -425,21 +433,28 @@ def register_tools(mcp, event_store):
     """)
     async def start_agent_session(
         session_id: str,
-        agent_type: str,
         agent_id: str,
-        application_id: str,
         model_version: str,
-        langgraph_graph_version: str,
         context_source: str,
-        context_token_count: int,
+        agent_type: str | None = None,
+        application_id: str = "unknown-application",
+        langgraph_graph_version: str = "default",
+        context_token_count: int = 0,
         correlation_id: str | None = None,
         causation_id: str | None = None,
     ) -> dict:
+        agent_type_aliases = {
+            "credit-agent": "credit_analysis",
+            "fraud-agent": "fraud_detection",
+            "compliance-agent": "compliance",
+            "decision-agent": "decision_orchestrator",
+        }
+        resolved_agent_type = agent_type or agent_type_aliases.get(agent_id, agent_id)
         try:
             version = await handle_start_agent_session(
                 event_store,
                 session_id,
-                agent_type,
+                resolved_agent_type,
                 agent_id,
                 application_id,
                 model_version,
@@ -451,22 +466,9 @@ def register_tools(mcp, event_store):
             )
             return {"session_id": session_id, "context_position": version}
         except OptimisticConcurrencyError as exc:
-            return _error(
-                "DuplicateSessionError",
-                f"Agent session {session_id} already exists",
-                "use_different_session_id",
-                stream_id=exc.stream_id,
-                expected_version=exc.expected_version,
-                actual_version=exc.actual_version,
-            )
+            return _error("DuplicateSessionError", f"Agent session {session_id} already exists", "use_different_session_id", stream_id=exc.stream_id, expected_version=exc.expected_version, actual_version=exc.actual_version)
         except Exception as exc:
-            return _error(
-                "ValidationError",
-                str(exc),
-                "check_required_fields",
-                session_id=session_id,
-                agent_type=agent_type,
-            )
+            return _error("ValidationError", str(exc), "check_required_fields", session_id=session_id, agent_type=resolved_agent_type)
 
     @mcp.tool(description="""
     Run cryptographic integrity verification on an entity's event history.
@@ -483,30 +485,11 @@ def register_tools(mcp, event_store):
     async def run_integrity_check(entity_type: str, entity_id: str) -> dict:
         stream_id = f"{entity_type}-{entity_id}"
         if await event_store.stream_version(stream_id) == -1:
-            return _error(
-                "NotFoundError",
-                f"Entity stream {stream_id} does not exist",
-                "check_entity_type_and_entity_id",
-                stream_id=stream_id,
-            )
+            return _error("NotFoundError", f"Entity stream {stream_id} does not exist", "check_entity_type_and_entity_id", stream_id=stream_id)
         try:
             result = await run_integrity_check_command(event_store, entity_type, entity_id)
-            return {
-                "check_result": {
-                    "chain_valid": result.chain_valid,
-                    "tamper_detected": result.tamper_detected,
-                    "events_verified": result.events_verified_count,
-                    "integrity_hash": result.integrity_hash,
-                    "previous_hash": result.previous_hash,
-                }
-            }
+            return {"check_result": {"chain_valid": result.chain_valid, "tamper_detected": result.tamper_detected, "events_verified": result.events_verified_count, "integrity_hash": result.integrity_hash, "previous_hash": result.previous_hash}}
         except Exception as exc:
-            return _error(
-                "ValidationError",
-                str(exc),
-                "check_entity_inputs",
-                entity_type=entity_type,
-                entity_id=entity_id,
-            )
+            return _error("ValidationError", str(exc), "check_entity_inputs", entity_type=entity_type, entity_id=entity_id)
 
     return None

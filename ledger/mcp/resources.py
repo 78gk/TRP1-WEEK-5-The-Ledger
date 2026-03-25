@@ -1,8 +1,13 @@
 from __future__ import annotations
 
-from datetime import datetime
+import json
+from datetime import datetime, timezone
 
 from ledger.projections.compliance_audit import ComplianceAuditViewProjection
+
+
+def _json(data) -> str:
+    return json.dumps(data, default=str)
 
 
 def _row_to_dict(row):
@@ -30,17 +35,17 @@ def register_resources(mcp, pool, projection_daemon):
     compliance_projection = ComplianceAuditViewProjection()
 
     @mcp.resource("ledger://applications/{application_id}")
-    async def get_application(application_id: str) -> dict:
+    async def get_application(application_id: str) -> str:
         """Read from ApplicationSummary projection. NEVER replays stream."""
         async with pool.acquire() as conn:
             row = await conn.fetchrow(
                 "SELECT * FROM application_summary WHERE application_id = $1",
                 application_id,
             )
-            return _row_to_dict(row)
+            return _json(_row_to_dict(row))
 
     @mcp.resource("ledger://applications/{application_id}/compliance")
-    async def get_compliance(application_id: str, as_of: str | None = None) -> dict:
+    async def get_compliance(application_id: str, as_of: str | None = None) -> str:
         """
         Read from ComplianceAuditView projection.
         Supports temporal query via as_of timestamp.
@@ -48,11 +53,11 @@ def register_resources(mcp, pool, projection_daemon):
         if as_of:
             timestamp = datetime.fromisoformat(as_of)
             history = await compliance_projection.get_compliance_at(pool, application_id, timestamp)
-            return {
+            return _json({
                 "application_id": application_id,
                 "as_of": as_of,
                 "events": history,
-            }
+            })
 
         async with pool.acquire() as conn:
             rows = await conn.fetch(
@@ -63,27 +68,27 @@ def register_resources(mcp, pool, projection_daemon):
                 """,
                 application_id,
             )
-            return {
+            return _json({
                 "application_id": application_id,
                 "events": [dict(row) for row in rows],
-            }
+            })
 
     @mcp.resource("ledger://applications/{application_id}/audit-trail")
-    async def get_audit_trail(application_id: str) -> dict:
+    async def get_audit_trail(application_id: str) -> str:
         """
         JUSTIFIED EXCEPTION: reads directly from the AuditLedger stream.
         Reason: audit trail retrieval requires full event-by-event history rather than
         a projection summary, so direct stream access is the intended exception.
         """
         events = await store.load_stream(f"audit-loan-{application_id}")
-        return {
+        return _json({
             "application_id": application_id,
             "stream_id": f"audit-loan-{application_id}",
             "events": [_event_to_dict(event) for event in events],
-        }
+        })
 
     @mcp.resource("ledger://agents/{agent_id}/performance")
-    async def get_agent_performance(agent_id: str) -> dict:
+    async def get_agent_performance(agent_id: str) -> str:
         """Read from AgentPerformanceLedger projection."""
         async with pool.acquire() as conn:
             rows = await conn.fetch(
@@ -91,14 +96,14 @@ def register_resources(mcp, pool, projection_daemon):
                 agent_id,
             )
             if not rows:
-                return {"error": "not_found"}
-            return {
+                return _json({"error": "not_found"})
+            return _json({
                 "agent_id": agent_id,
                 "models": [dict(row) for row in rows],
-            }
+            })
 
     @mcp.resource("ledger://agents/{agent_id}/sessions/{session_id}")
-    async def get_agent_session(agent_id: str, session_id: str) -> dict:
+    async def get_agent_session(agent_id: str, session_id: str) -> str:
         """
         JUSTIFIED EXCEPTION: reads directly from the AgentSession stream.
         Reason: crash recovery and fine-grained session inspection require the full
@@ -106,24 +111,24 @@ def register_resources(mcp, pool, projection_daemon):
         """
         events = await store.load_stream(f"agent-{agent_id}-{session_id}")
         if not events:
-            return {"error": "not_found"}
-        return {
+            return _json({"error": "not_found"})
+        return _json({
             "agent_id": agent_id,
             "session_id": session_id,
             "stream_id": f"agent-{agent_id}-{session_id}",
             "events": [_event_to_dict(event) for event in events],
-        }
+        })
 
     @mcp.resource("ledger://ledger/health")
-    async def get_health() -> dict:
+    async def get_health() -> str:
         """Returns per-projection lag in milliseconds."""
         lags = await projection_daemon.get_all_lags()
-        return {
+        return _json({
             "status": "healthy" if all(value < 1000 for value in lags.values()) else "degraded",
             "projections": {
                 name: {"lag_ms": lag}
                 for name, lag in lags.items()
             },
-        }
+        })
 
     return None
