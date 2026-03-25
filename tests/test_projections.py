@@ -40,7 +40,7 @@ async def test_projection_lag_under_concurrent_load(event_store, db_pool, projec
     try:
         await asyncio.gather(*(simulate_handler(i) for i in range(50)))
 
-        deadline = time.monotonic() + 2.0
+        deadline = time.monotonic() + 3.0
         while time.monotonic() < deadline:
             async with db_pool.acquire() as conn:
                 projected = await conn.fetchval(

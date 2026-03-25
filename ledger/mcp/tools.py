@@ -171,14 +171,14 @@ def register_tools(mcp, event_store):
         correlation_id: str | None = None,
         causation_id: str | None = None,
     ) -> dict:
-        decision_dict = {
-            "risk_tier": risk_tier,
-            "recommended_limit_usd": recommended_limit_usd,
-            "confidence": confidence_score,
-            "rationale": rationale,
-        }
-        await _ensure_credit_analysis_requested(event_store, application_id)
         try:
+            decision_dict = {
+                "risk_tier": risk_tier,
+                "recommended_limit_usd": recommended_limit_usd,
+                "confidence": confidence_score,
+                "rationale": rationale,
+            }
+            await _ensure_credit_analysis_requested(event_store, application_id)
             version = await handle_credit_analysis_completed(
                 event_store,
                 application_id,
@@ -276,8 +276,8 @@ def register_tools(mcp, event_store):
         correlation_id: str | None = None,
         causation_id: str | None = None,
     ) -> dict:
-        await _ensure_compliance_requested(event_store, application_id, ["REG-001", "REG-002", "REG-003"])
         try:
+            await _ensure_compliance_requested(event_store, application_id, ["REG-001", "REG-002", "REG-003"])
             version = await handle_compliance_check(
                 event_store,
                 application_id,
@@ -327,9 +327,9 @@ def register_tools(mcp, event_store):
         correlation_id: str | None = None,
         causation_id: str | None = None,
     ) -> dict:
-        await _ensure_compliance_completed(event_store, application_id)
-        await _ensure_decision_requested(event_store, application_id)
         try:
+            await _ensure_compliance_completed(event_store, application_id)
+            await _ensure_decision_requested(event_store, application_id)
             inferred_sessions, inferred_model_versions = await _infer_decision_context(
                 event_store,
                 application_id,
