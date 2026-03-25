@@ -213,6 +213,26 @@ class StoredEvent(BaseModel):
         """Construct from a raw asyncpg row dict or InMemoryEventStore dict."""
         return cls(**row)
 
+    def copy_with(self, *, payload: dict, event_version: int) -> "StoredEvent":
+        """
+        Return a NEW StoredEvent with updated payload and event_version.
+        ALL other envelope fields (event_id, stream_id, stream_position,
+        global_position, recorded_at, metadata, event_type) are preserved
+        unchanged.  Used exclusively by UpcasterRegistry to avoid mutating
+        the original object.
+        """
+        return StoredEvent(
+            event_id=self.event_id,
+            stream_id=self.stream_id,
+            stream_position=self.stream_position,
+            global_position=self.global_position,
+            recorded_at=self.recorded_at,
+            metadata=self.metadata,
+            event_type=self.event_type,
+            event_version=event_version,
+            payload=payload,
+        )
+
 
 # ─── STREAM METADATA ──────────────────────────────────────────────────────────
 
@@ -694,6 +714,7 @@ class AuditIntegrityCheckRun(BaseEvent):
     events_verified_count: int
     integrity_hash: str
     previous_hash: str | None
+    last_verified_position: int = 0
     chain_valid: bool
     tamper_detected: bool
 

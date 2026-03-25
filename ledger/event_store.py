@@ -22,6 +22,8 @@ from ledger.schema.events import (
     StoredEvent,                 # noqa: F401
     StreamMetadata,
 )
+from ledger.upcasting import UpcasterRegistry as CanonicalUpcasterRegistry
+from ledger.upcasting import registry as default_upcaster_registry
 
 
 # OptimisticConcurrencyError is now defined in ledger.schema.events and imported above.
@@ -82,7 +84,7 @@ class EventStore:
         # Accept either (pool=pool) or (db_url) for backwards-compat.
         self._pool: asyncpg.Pool | None = pool
         self._db_url: str | None = db_url
-        self.upcasters = upcaster_registry
+        self.upcasters = upcaster_registry or default_upcaster_registry
 
     # ── Lifecycle (only needed for the URL-based path) ───────────────────────
 
@@ -303,10 +305,10 @@ class EventStore:
         result = []
         for row in rows:
             d = dict(row)
+            event = self._to_stored(d)
             if self.upcasters:
-                # upcasters work on raw dicts keyed by event_type / event_version
-                d = self.upcasters.upcast(d)
-            result.append(self._to_stored(d))
+                event = self.upcasters.upcast(event)
+            result.append(event)
 
         return result
 
@@ -357,9 +359,10 @@ class EventStore:
 
             for row in rows:
                 d = dict(row)
+                event = self._to_stored(d)
                 if self.upcasters:
-                    d = self.upcasters.upcast(d)
-                yield self._to_stored(d)
+                    event = self.upcasters.upcast(event)
+                yield event
 
             position = int(rows[-1]["global_position"])
 
@@ -407,7 +410,7 @@ class EventStore:
 # UPCASTER REGISTRY — Phase 4
 # ─────────────────────────────────────────────────────────────────────────────
 
-class UpcasterRegistry:
+class UpcasterRegistry(CanonicalUpcasterRegistry):
     """
     Transforms old event versions to current versions on load.
     Upcasters are PURE functions — they never write to the database.
@@ -431,24 +434,13 @@ class UpcasterRegistry:
     """
 
     def __init__(self):
-        self._upcasters: dict[str, dict[int, callable]] = {}
+        super().__init__()
 
     def upcaster(self, event_type: str, from_version: int, to_version: int):
-        def decorator(fn):
-            self._upcasters.setdefault(event_type, {})[from_version] = fn
-            return fn
-        return decorator
+        return self.register(event_type, from_version)
 
     def upcast(self, event: dict) -> dict:
-        """Apply chain of upcasters until latest version reached."""
-        et = event["event_type"]
-        v = event.get("event_version", 1)
-        chain = self._upcasters.get(et, {})
-        while v in chain:
-            event["payload"] = chain[v](dict(event["payload"]))
-            v += 1
-            event["event_version"] = v
-        return event
+        return super().upcast(event)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
