@@ -184,3 +184,19 @@ class LoanApplicationAggregate:
                 f"Cannot approve application: confidence {confidence:.2f} is below 0.60 threshold. "
                 f"Recommendation must be REFER."
             )
+
+    def assert_state(self, expected: str) -> None:
+        if self.state.name != expected:
+            raise DomainError(
+                f"Application must be in {expected} state (currently {self.state.name})"
+            )
+
+    def assert_awaiting_human_review(self) -> None:
+        if self.state not in {
+            ApplicationState.PENDING_DECISION,
+            ApplicationState.APPROVED_PENDING_HUMAN,
+            ApplicationState.DECLINED_PENDING_HUMAN,
+        }:
+            raise DomainError(
+                f"Application must be awaiting human review (currently {self.state.name})"
+            )
