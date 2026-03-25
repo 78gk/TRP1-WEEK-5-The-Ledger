@@ -7,6 +7,7 @@ mcp = FastMCP("TheLedger")
 
 
 def create_mcp_server(event_store, pool, projection_daemon):
-    register_tools(mcp, event_store)
-    register_resources(mcp, pool, projection_daemon)
-    return mcp
+    server = FastMCP("TheLedger")
+    register_tools(server, event_store)
+    register_resources(server, pool, projection_daemon)
+    return server

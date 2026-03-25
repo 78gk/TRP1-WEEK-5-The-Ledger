@@ -24,6 +24,7 @@ from ledger.schema.events import (
 )
 from ledger.upcasting import UpcasterRegistry as CanonicalUpcasterRegistry
 from ledger.upcasting import registry as default_upcaster_registry
+from ledger.upcasting.registry import UpcastContext
 
 
 # OptimisticConcurrencyError is now defined in ledger.schema.events and imported above.
@@ -112,6 +113,12 @@ class EventStore:
 
     def _to_stored(self, row) -> StoredEvent:
         return _row_to_stored_event(row)
+
+    def _make_upcast_context(self) -> UpcastContext:
+        async def load_stream(stream_id: str) -> list[StoredEvent]:
+            return await self.load_stream(stream_id)
+
+        return UpcastContext(load_stream=load_stream)
 
     # ── Public API ───────────────────────────────────────────────────────────
 
@@ -303,11 +310,12 @@ class EventStore:
             rows = await conn.fetch(q, *params)
 
         result = []
+        context = self._make_upcast_context() if self.upcasters else None
         for row in rows:
             d = dict(row)
             event = self._to_stored(d)
             if self.upcasters:
-                event = self.upcasters.upcast(event)
+                event = await self.upcasters.upcast(event, context=context)
             result.append(event)
 
         return result
@@ -361,7 +369,10 @@ class EventStore:
                 d = dict(row)
                 event = self._to_stored(d)
                 if self.upcasters:
-                    event = self.upcasters.upcast(event)
+                    event = await self.upcasters.upcast(
+                        event,
+                        context=self._make_upcast_context(),
+                    )
                 yield event
 
             position = int(rows[-1]["global_position"])
@@ -439,8 +450,8 @@ class UpcasterRegistry(CanonicalUpcasterRegistry):
     def upcaster(self, event_type: str, from_version: int, to_version: int):
         return self.register(event_type, from_version)
 
-    def upcast(self, event: dict) -> dict:
-        return super().upcast(event)
+    async def upcast(self, event: dict, context: UpcastContext | None = None) -> dict:
+        return await super().upcast(event, context=context)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -474,6 +485,12 @@ class InMemoryEventStore:
         # asyncio lock per stream for OCC
         self._locks: dict[str, _asyncio.Lock] = _defaultdict(_asyncio.Lock)
         self.upcasters = upcaster_registry or default_upcaster_registry
+
+    def _make_upcast_context(self) -> UpcastContext:
+        async def load_stream(stream_id: str) -> list[dict]:
+            return await self.load_stream(stream_id)
+
+        return UpcastContext(load_stream=load_stream)
 
     async def stream_version(self, stream_id: str) -> int:
         return self._versions.get(stream_id, -1)
@@ -532,9 +549,10 @@ class InMemoryEventStore:
         if not self.upcasters:
             return ordered
         upcasted: list[dict] = []
+        context = self._make_upcast_context()
         for event in ordered:
             stored = StoredEvent.from_row(event)
-            current = self.upcasters.upcast(stored)
+            current = await self.upcasters.upcast(stored, context=context)
             upcasted.append(current.model_dump(mode="json"))
         return upcasted
 
@@ -555,7 +573,12 @@ class InMemoryEventStore:
             event = e
             if self.upcasters:
                 stored = StoredEvent.from_row(e)
-                event = self.upcasters.upcast(stored).model_dump(mode="json")
+                event = (
+                    await self.upcasters.upcast(
+                        stored,
+                        context=self._make_upcast_context(),
+                    )
+                ).model_dump(mode="json")
             yield event
             yielded += 1
             if yielded % batch_size == 0:

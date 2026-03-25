@@ -18,9 +18,16 @@ database row is NEVER modified.
 """
 from __future__ import annotations
 
-from typing import Callable
+import inspect
+from dataclasses import dataclass
+from typing import Awaitable, Callable
 
 from ledger.schema.events import StoredEvent
+
+
+@dataclass(slots=True)
+class UpcastContext:
+    load_stream: Callable[[str], Awaitable[list]]
 
 
 class UpcasterRegistry:
@@ -33,7 +40,7 @@ class UpcasterRegistry:
     """
 
     def __init__(self) -> None:
-        self._upcasters: dict[tuple[str, int], Callable[[dict], dict]] = {}
+        self._upcasters: dict[tuple[str, int], Callable] = {}
 
     def register(self, event_type: str, from_version: int) -> Callable:
         """
@@ -49,7 +56,21 @@ class UpcasterRegistry:
 
         return decorator
 
-    def upcast(self, event: StoredEvent) -> StoredEvent:
+    async def _invoke(self, fn: Callable, payload: dict, context: UpcastContext | None) -> dict:
+        parameters = inspect.signature(fn).parameters
+        if len(parameters) >= 2:
+            result = fn(payload, context)
+        else:
+            result = fn(payload)
+        if inspect.isawaitable(result):
+            result = await result
+        return result
+
+    async def upcast(
+        self,
+        event: StoredEvent,
+        context: UpcastContext | None = None,
+    ) -> StoredEvent:
         """
         Apply the FULL version chain for the event's type and starting version.
 
@@ -68,7 +89,7 @@ class UpcasterRegistry:
             fn = self._upcasters[(event.event_type, v)]
             # Pass a *copy* of the payload dict so upcasters cannot accidentally
             # mutate the object they received.
-            new_payload = fn(dict(current.payload))
+            new_payload = await self._invoke(fn, dict(current.payload), context)
             current = current.copy_with(payload=new_payload, event_version=v + 1)
             v += 1
 

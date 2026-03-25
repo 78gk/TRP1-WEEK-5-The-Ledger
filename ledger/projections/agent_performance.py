@@ -209,12 +209,12 @@ class AgentPerformanceLedgerProjection:
                 (agent_id, model_version, analyses_completed,
                  human_override_count, human_override_rate,
                  first_seen_at, last_seen_at)
-            VALUES ($1, $2, 1, $3, $3::numeric, $4, $4)
+            VALUES ($1, $2, 1, $3::int, $3::numeric, $4, $4)
             ON CONFLICT (agent_id, model_version) DO UPDATE SET
                 analyses_completed  = agent_performance_ledger.analyses_completed + 1,
-                human_override_count = agent_performance_ledger.human_override_count + $3,
+                human_override_count = agent_performance_ledger.human_override_count + $3::int,
                 human_override_rate  = (
-                    agent_performance_ledger.human_override_count + $3
+                    agent_performance_ledger.human_override_count + $3::int
                 )::numeric
                 / (agent_performance_ledger.analyses_completed + 1),
                 last_seen_at = GREATEST(agent_performance_ledger.last_seen_at, $4)

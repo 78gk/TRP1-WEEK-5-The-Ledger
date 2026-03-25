@@ -135,3 +135,96 @@ async def test_tamper_detection_after_db_modification(event_store, db_pool):
 
     result2 = await run_integrity_check(event_store, entity_type, entity_id)
     assert result2.tamper_detected is True
+
+
+async def test_decision_upcaster_reconstructs_model_versions(event_store, db_pool):
+    application_id = "test-decision-upcast"
+    session_id = "decision-upcast-session"
+    decision_event_id = uuid4()
+
+    async with db_pool.acquire() as conn:
+        await conn.execute(
+            """
+            INSERT INTO event_streams (stream_id, aggregate_type, current_version)
+            VALUES ($1, $2, 0)
+            ON CONFLICT (stream_id) DO NOTHING
+            """,
+            f"agent-credit_analysis-{session_id}",
+            "agent",
+        )
+        await conn.execute(
+            """
+            INSERT INTO events (
+                event_id, stream_id, stream_position, event_type, event_version, payload, metadata
+            )
+            VALUES (
+                gen_random_uuid(), $1, 0, 'AgentSessionStarted', 1, $2::jsonb, '{}'::jsonb
+            )
+            """,
+            f"agent-credit_analysis-{session_id}",
+            json.dumps(
+                {
+                    "session_id": session_id,
+                    "agent_type": "credit_analysis",
+                    "agent_id": "credit-agent",
+                    "application_id": application_id,
+                    "model_version": "credit-model-v9.9",
+                    "langgraph_graph_version": "graph-v1",
+                    "context_source": "fresh",
+                    "context_token_count": 0,
+                    "started_at": datetime.now(timezone.utc).isoformat(),
+                }
+            ),
+        )
+
+        await conn.execute(
+            """
+            INSERT INTO event_streams (stream_id, aggregate_type, current_version)
+            VALUES ($1, $2, 0)
+            """,
+            f"loan-{application_id}",
+            "loan",
+        )
+        await conn.execute(
+            """
+            INSERT INTO events (
+                event_id, stream_id, stream_position, event_type, event_version, payload, metadata
+            )
+            VALUES ($1, $2, 0, 'DecisionGenerated', 1, $3::jsonb, '{}'::jsonb)
+            """,
+            decision_event_id,
+            f"loan-{application_id}",
+            json.dumps(
+                {
+                    "application_id": application_id,
+                    "orchestrator_session_id": "orchestrator-1",
+                    "recommendation": "APPROVE",
+                    "confidence": 0.91,
+                    "approved_amount_usd": 100000,
+                    "conditions": [],
+                    "executive_summary": "legacy decision",
+                    "key_risks": [],
+                    "contributing_sessions": [f"agent-credit_analysis-{session_id}"],
+                    "generated_at": datetime.now(timezone.utc).isoformat(),
+                }
+            ),
+        )
+
+    events = await event_store.load_stream(f"loan-{application_id}")
+    assert len(events) == 1
+    loaded = events[0]
+    assert loaded.event_version == 2
+    assert loaded.payload["model_versions"]["credit_analysis"] == "credit-model-v9.9"
+
+    async with db_pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT payload, event_version FROM events WHERE event_id = $1",
+            decision_event_id,
+        )
+
+    raw_payload = row["payload"]
+    if isinstance(raw_payload, str):
+        raw_payload = json.loads(raw_payload)
+
+    assert row["event_version"] == 1
+    assert "model_versions" not in raw_payload

@@ -10,7 +10,7 @@ Inference strategy is documented inline with reasoning for each field choice.
 """
 from __future__ import annotations
 
-from ledger.upcasting.registry import UpcasterRegistry
+from ledger.upcasting.registry import UpcastContext, UpcasterRegistry
 
 registry = UpcasterRegistry()
 
@@ -113,7 +113,7 @@ def _infer_regulatory_basis(recorded_at: str) -> list[str]:
 # ─── DecisionGenerated  v1 → v2 ───────────────────────────────────────────────
 
 @registry.register("DecisionGenerated", from_version=1)
-def upcast_decision_v1_to_v2(payload: dict) -> dict:
+async def upcast_decision_v1_to_v2(payload: dict, context: UpcastContext | None = None) -> dict:
     """
     v2 adds: model_versions dict (agent_type -> model_version string).
 
@@ -143,6 +143,19 @@ def upcast_decision_v1_to_v2(payload: dict) -> dict:
         if len(parts) != 3 or parts[0] != "agent":
             continue
         agent_type = parts[1]
+
+        if context is not None:
+            session_events = await context.load_stream(session_ref)
+            for event in session_events:
+                event_type = event["event_type"] if isinstance(event, dict) else event.event_type
+                payload_dict = event["payload"] if isinstance(event, dict) else event.payload
+                if event_type == "AgentSessionStarted":
+                    resolved_type = payload_dict.get("agent_type", agent_type)
+                    resolved_version = payload_dict.get("model_version")
+                    if resolved_version:
+                        model_versions.setdefault(resolved_type, resolved_version)
+                    break
+
         model_versions.setdefault(
             agent_type,
             "unknown (inferred from contributing session reference)",
