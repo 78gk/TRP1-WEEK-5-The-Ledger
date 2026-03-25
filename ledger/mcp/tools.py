@@ -1,11 +1,16 @@
 from __future__ import annotations
 
-from datetime import datetime, timezone
 from uuid import uuid4
 
 from ledger.commands.handlers import (
+    handle_complete_compliance_review,
+    handle_compliance_check,
     handle_credit_analysis_completed,
+    handle_fraud_screening_completed,
     handle_generate_decision,
+    handle_request_compliance_review,
+    handle_request_credit_analysis,
+    handle_request_decision,
     handle_human_review_completed,
     handle_start_agent_session,
     handle_submit_application,
@@ -23,96 +28,80 @@ def _error(error_type: str, message: str, suggested_action: str, **context) -> d
     }
 
 
-async def _append_event(event_store, stream_id: str, event_type: str, payload: dict) -> int:
-    expected_version = await event_store.stream_version(stream_id)
-    return await event_store.append(
-        stream_id=stream_id,
-        events=[{"event_type": event_type, "event_version": 1, "payload": payload}],
-        expected_version=expected_version,
-    )
-
-
 async def _ensure_credit_analysis_requested(event_store, application_id: str) -> None:
-    stream_id = f"loan-{application_id}"
-    events = await event_store.load_stream(stream_id)
-    if any(event.event_type == "CreditAnalysisRequested" for event in events):
+    loan_events = await event_store.load_stream(f"loan-{application_id}")
+    if any(event.event_type == "CreditAnalysisRequested" for event in loan_events):
         return
-    await _append_event(
+    await handle_request_credit_analysis(
         event_store,
-        stream_id,
-        "CreditAnalysisRequested",
-        {
-            "application_id": application_id,
-            "requested_at": datetime.now(timezone.utc).isoformat(),
-            "requested_by": "mcp",
-            "priority": "NORMAL",
-        },
+        application_id,
+        requested_by="mcp",
+        priority="NORMAL",
     )
 
 
 async def _ensure_compliance_requested(event_store, application_id: str, rules: list[str]) -> None:
-    stream_id = f"loan-{application_id}"
-    events = await event_store.load_stream(stream_id)
-    if any(event.event_type == "ComplianceCheckRequested" for event in events):
+    loan_events = await event_store.load_stream(f"loan-{application_id}")
+    if any(event.event_type == "ComplianceCheckRequested" for event in loan_events):
         return
-    await _append_event(
+    await handle_request_compliance_review(
         event_store,
-        stream_id,
-        "ComplianceCheckRequested",
-        {
-            "application_id": application_id,
-            "requested_at": datetime.now(timezone.utc).isoformat(),
-            "triggered_by_event_id": "mcp",
-            "regulation_set_version": "2026-Q1",
-            "rules_to_evaluate": rules,
-        },
+        application_id,
+        regulation_set_version="2026-Q1",
+        rules_to_evaluate=rules,
+        triggered_by_event_id="mcp",
     )
 
 
 async def _ensure_decision_requested(event_store, application_id: str) -> None:
-    stream_id = f"loan-{application_id}"
-    events = await event_store.load_stream(stream_id)
-    if any(event.event_type == "DecisionRequested" for event in events):
+    loan_events = await event_store.load_stream(f"loan-{application_id}")
+    if any(event.event_type == "DecisionRequested" for event in loan_events):
         return
-    await _append_event(
+    await handle_request_decision(
         event_store,
-        stream_id,
-        "DecisionRequested",
-        {
-            "application_id": application_id,
-            "requested_at": datetime.now(timezone.utc).isoformat(),
-            "all_analyses_complete": True,
-            "triggered_by_event_id": "mcp",
-        },
+        application_id,
+        triggered_by_event_id="mcp",
     )
 
 
 async def _ensure_compliance_completed(event_store, application_id: str) -> None:
-    stream_id = f"compliance-{application_id}"
-    events = await event_store.load_stream(stream_id)
-    if any(event.event_type == "ComplianceCheckCompleted" for event in events):
+    compliance_events = await event_store.load_stream(f"compliance-{application_id}")
+    if any(event.event_type == "ComplianceCheckCompleted" for event in compliance_events):
         return
-
-    passed = sum(1 for event in events if event.event_type == "ComplianceRulePassed")
-    failed = sum(1 for event in events if event.event_type == "ComplianceRuleFailed")
-    noted = sum(1 for event in events if event.event_type == "ComplianceRuleNoted")
-
-    await _append_event(
+    await handle_complete_compliance_review(
         event_store,
-        stream_id,
-        "ComplianceCheckCompleted",
-        {
-            "application_id": application_id,
-            "session_id": "mcp-compliance",
-            "rules_evaluated": passed + failed + noted,
-            "rules_passed": passed,
-            "rules_failed": failed,
-            "rules_noted": noted,
-            "has_hard_block": False,
-            "overall_verdict": "CLEAR",
-            "completed_at": datetime.now(timezone.utc).isoformat(),
-        },
+        application_id,
+        session_id="mcp-compliance",
     )
+
+
+async def _infer_decision_context(event_store, application_id: str) -> tuple[list[str], dict[str, str]]:
+    contributing_sessions: list[str] = []
+    model_versions: dict[str, str] = {}
+
+    loan_events = await event_store.load_stream(f"loan-{application_id}")
+    fraud_events = await event_store.load_stream(f"fraud-{application_id}")
+
+    for event in loan_events:
+        if event.event_type == "CreditAnalysisCompleted":
+            session_id = event.payload.get("session_id")
+            model_version = event.payload.get("model_version")
+            if session_id:
+                contributing_sessions.append(f"agent-credit_analysis-{session_id}")
+            if model_version:
+                model_versions["credit_analysis"] = model_version
+
+    for event in fraud_events:
+        if event.event_type == "FraudScreeningCompleted":
+            session_id = event.payload.get("session_id")
+            model_version = event.payload.get("screening_model_version")
+            if session_id:
+                contributing_sessions.append(f"agent-fraud_detection-{session_id}")
+            if model_version:
+                model_versions["fraud_detection"] = model_version
+
+    deduped_sessions = list(dict.fromkeys(contributing_sessions))
+    return deduped_sessions, model_versions
 
 
 def register_tools(mcp, event_store):
@@ -238,21 +227,19 @@ def register_tools(mcp, event_store):
         causation_id: str | None = None,
     ) -> dict:
         try:
-            version = await _append_event(
+            version = await handle_fraud_screening_completed(
                 event_store,
-                f"fraud-{application_id}",
-                "FraudScreeningCompleted",
-                {
-                    "application_id": application_id,
-                    "session_id": session_id,
-                    "fraud_score": fraud_score,
-                    "risk_level": risk_level,
-                    "anomalies_found": anomalies_found,
-                    "recommendation": recommendation,
-                    "screening_model_version": screening_model_version,
-                    "input_data_hash": input_data_hash,
-                    "completed_at": datetime.now(timezone.utc).isoformat(),
-                },
+                application_id,
+                agent_id,
+                session_id,
+                fraud_score,
+                risk_level,
+                anomalies_found,
+                recommendation,
+                screening_model_version,
+                input_data_hash,
+                correlation_id=correlation_id,
+                causation_id=causation_id,
             )
             await _ensure_compliance_requested(event_store, application_id, ["REG-001", "REG-002", "REG-003"])
             return {"event_id": str(uuid4()), "new_stream_version": version}
@@ -291,26 +278,23 @@ def register_tools(mcp, event_store):
     ) -> dict:
         await _ensure_compliance_requested(event_store, application_id, ["REG-001", "REG-002", "REG-003"])
         try:
-            event_type = "ComplianceRulePassed" if passed else "ComplianceRuleFailed"
-            payload = {
-                "application_id": application_id,
-                "session_id": session_id,
-                "rule_id": rule_id,
-                "rule_name": rule_name or rule_id,
-                "rule_version": rule_version,
-                "evaluated_at": datetime.now(timezone.utc).isoformat(),
-            }
-            if passed:
-                payload.update({"evidence_hash": evidence_hash, "evaluation_notes": ""})
-            else:
-                payload.update({
-                    "failure_reason": failure_reason or "Unspecified failure",
-                    "is_hard_block": is_hard_block,
-                    "remediation_available": remediation_available,
-                    "remediation_description": remediation_description,
-                    "evidence_hash": evidence_hash,
-                })
-            version = await _append_event(event_store, f"compliance-{application_id}", event_type, payload)
+            version = await handle_compliance_check(
+                event_store,
+                application_id,
+                session_id,
+                rule_id,
+                rule_name or rule_id,
+                rule_version,
+                passed,
+                failure_reason=failure_reason,
+                is_hard_block=is_hard_block,
+                remediation_available=remediation_available,
+                remediation_description=remediation_description,
+                evidence_hash=evidence_hash,
+                note_type=note_type,
+                correlation_id=correlation_id,
+                causation_id=causation_id,
+            )
             return {"event_id": str(uuid4()), "new_stream_version": version}
         except OptimisticConcurrencyError as exc:
             return _error("OptimisticConcurrencyError", f"Stream {exc.stream_id} was modified", "reload_stream_and_retry", stream_id=exc.stream_id, expected_version=exc.expected_version, actual_version=exc.actual_version)
@@ -346,6 +330,10 @@ def register_tools(mcp, event_store):
         await _ensure_compliance_completed(event_store, application_id)
         await _ensure_decision_requested(event_store, application_id)
         try:
+            inferred_sessions, inferred_model_versions = await _infer_decision_context(
+                event_store,
+                application_id,
+            )
             version = await handle_generate_decision(
                 event_store,
                 application_id,
@@ -356,8 +344,8 @@ def register_tools(mcp, event_store):
                 conditions or [],
                 executive_summary,
                 key_risks or [],
-                contributing_sessions or [],
-                model_versions=model_versions,
+                contributing_sessions or inferred_sessions,
+                model_versions=model_versions or inferred_model_versions,
                 correlation_id=correlation_id,
                 causation_id=causation_id,
             )

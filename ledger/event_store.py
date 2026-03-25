@@ -461,17 +461,19 @@ class InMemoryEventStore:
     Same interface as EventStore — swap one for the other with no code changes.
     """
 
-    def __init__(self):
+    def __init__(self, upcaster_registry=None):
         # stream_id -> list of event dicts
         self._streams: dict[str, list[dict]] = _defaultdict(list)
         # stream_id -> current version (position of last event, -1 if empty)
         self._versions: dict[str, int] = {}
+        self._archived_at: dict[str, str | None] = {}
         # global append log (ordered by insertion)
         self._global: list[dict] = []
         # projection checkpoints
         self._checkpoints: dict[str, int] = {}
         # asyncio lock per stream for OCC
         self._locks: dict[str, _asyncio.Lock] = _defaultdict(_asyncio.Lock)
+        self.upcasters = upcaster_registry or default_upcaster_registry
 
     async def stream_version(self, stream_id: str) -> int:
         return self._versions.get(stream_id, -1)
@@ -512,6 +514,7 @@ class InMemoryEventStore:
                 positions.append(pos)
 
             self._versions[stream_id] = current + len(events)
+            self._archived_at.setdefault(stream_id, None)
             return positions
 
     async def load_stream(
@@ -525,12 +528,38 @@ class InMemoryEventStore:
             if e["stream_position"] >= from_position
             and (to_position is None or e["stream_position"] <= to_position)
         ]
-        return sorted(events, key=lambda e: e["stream_position"])
+        ordered = sorted(events, key=lambda e: e["stream_position"])
+        if not self.upcasters:
+            return ordered
+        upcasted: list[dict] = []
+        for event in ordered:
+            stored = StoredEvent.from_row(event)
+            current = self.upcasters.upcast(stored)
+            upcasted.append(current.model_dump(mode="json"))
+        return upcasted
 
-    async def load_all(self, from_position: int = 0, batch_size: int = 500):
+    async def load_all(
+        self,
+        from_global_position: int = 0,
+        event_types: list[str] | None = None,
+        batch_size: int = 500,
+        from_position: int | None = None,
+    ):
+        start = from_global_position if from_position is None else from_position
+        yielded = 0
         for e in self._global:
-            if e["global_position"] >= from_position:
-                yield e
+            if e["global_position"] < start:
+                continue
+            if event_types and e["event_type"] not in event_types:
+                continue
+            event = e
+            if self.upcasters:
+                stored = StoredEvent.from_row(e)
+                event = self.upcasters.upcast(stored).model_dump(mode="json")
+            yield event
+            yielded += 1
+            if yielded % batch_size == 0:
+                await _asyncio.sleep(0)
 
     async def get_event(self, event_id: str) -> dict | None:
         for e in self._global:
@@ -543,3 +572,22 @@ class InMemoryEventStore:
 
     async def load_checkpoint(self, projection_name: str) -> int:
         return self._checkpoints.get(projection_name, 0)
+
+    async def archive_stream(self, stream_id: str) -> None:
+        if stream_id in self._versions:
+            self._archived_at[stream_id] = _datetime.now(_timezone.utc).isoformat()
+
+    async def get_stream_metadata(self, stream_id: str) -> StreamMetadata:
+        if stream_id not in self._versions:
+            raise KeyError(f"Stream not found: {stream_id!r}")
+        return StreamMetadata(
+            stream_id=stream_id,
+            aggregate_type=_extract_aggregate_type(stream_id),
+            current_version=self._versions[stream_id],
+            created_at=_datetime.now(_timezone.utc),
+            archived_at=(
+                _datetime.fromisoformat(self._archived_at[stream_id])
+                if self._archived_at.get(stream_id)
+                else None
+            ),
+        )

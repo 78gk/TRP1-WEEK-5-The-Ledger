@@ -24,13 +24,25 @@ class ComplianceRecordAggregate:
     overall_verdict: str | None = None
     has_hard_block: bool = False
     regulation_set_version: str | None = None
-    _version: int = field(default=0, repr=False)
+    _version: int = field(default=-1, repr=False)
 
     @classmethod
     async def load(cls, store, application_id: str) -> "ComplianceRecordAggregate":
-        """Load and replay the compliance stream to rebuild aggregate state."""
+        """
+        Load and replay the compliance stream to rebuild aggregate state.
+
+        ComplianceCheckRequested is emitted on the primary loan stream, so we
+        merge that trigger event into the replay for rule-completeness checks.
+        """
         stream_id = f"compliance-{application_id}"
-        events = await store.load_stream(stream_id)
+        events = list(await store.load_stream(stream_id))
+        upstream = [
+            event
+            for event in await store.load_stream(f"loan-{application_id}")
+            if event.event_type == "ComplianceCheckRequested"
+        ]
+        events.extend(upstream)
+        events.sort(key=lambda event: getattr(event, "global_position", -1))
         agg = cls(application_id=application_id)
         for event in events:
             agg._apply(event)
@@ -46,7 +58,8 @@ class ComplianceRecordAggregate:
         handler = getattr(self, handler_name, None)
         if handler is not None:
             handler(event)
-        self._version = event.stream_position
+        if getattr(event, "stream_id", "").startswith("compliance-"):
+            self._version = event.stream_position
 
     # ─── EVENT HANDLERS ───────────────────────────────────────────────────────
 
@@ -112,6 +125,18 @@ class ComplianceRecordAggregate:
                 "Cannot proceed: compliance hard block active. "
                 "A hard-block rule failure prohibits any approval path."
             )
+
+    def assert_rule_is_expected(self, rule_id: str) -> None:
+        if self.checks_required and rule_id not in self.checks_required:
+            raise DomainError(
+                f"Rule {rule_id!r} is not part of the active regulation set "
+                f"for application {self.application_id!r}."
+            )
+
+    def assert_decision_allowed(self, recommendation: str) -> None:
+        self.assert_all_mandatory_checks_complete()
+        if recommendation.upper() != "DECLINE":
+            self.assert_no_hard_block()
 
     def is_clear(self) -> bool:
         """Return True iff the overall compliance verdict is CLEAR."""

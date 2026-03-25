@@ -119,29 +119,36 @@ def upcast_decision_v1_to_v2(payload: dict) -> dict:
 
     ── Inference strategy ────────────────────────────────────────────────────
 
-    model_versions: CANNOT be reconstructed without store access
-        Reasoning: In production, this would be populated by loading each
-        contributing session's AgentSessionStarted event to retrieve its
-        model_version.  However, upcasters MUST be pure functions — they
-        cannot call the event store or any external service.
+    model_versions: reconstructed from contributing session references
+        Reasoning: a pure upcaster cannot load external session streams, but it
+        can still recover the agent-type keys from the recorded contributing
+        session references. We preserve those keys and mark each value as
+        unknown/inferred rather than fabricating a precise deployment string.
 
-        Therefore: we set model_versions to an empty dict with a note.
-
-        NOTE (performance concern for production):
-        A store-lookup upcaster would require N additional stream loads per
-        DecisionGenerated event (one per contributing session), making every
-        aggregate load O(N*session_count).  In production this should be handled
-        by a one-time migration script that runs offline and patches the stored
-        payload directly — NOT by a read-time upcaster.  This is documented in
-        DESIGN.md as a known performance concern.
+        NOTE (production concern):
+        Exact model-version recovery still requires an offline migration that
+        joins against session streams, because the v1 payload never persisted
+        the deployment identifiers directly.
 
     contributing_sessions: Preserved as-is from v1 payload so callers can still
         use it as a reference list for external lookups.
     """
+    contributing_sessions = payload.get("contributing_sessions") or []
+    model_versions: dict[str, str] = {}
+
+    for session_ref in contributing_sessions:
+        if not isinstance(session_ref, str):
+            continue
+        parts = session_ref.split("-", 2)
+        if len(parts) != 3 or parts[0] != "agent":
+            continue
+        agent_type = parts[1]
+        model_versions.setdefault(
+            agent_type,
+            "unknown (inferred from contributing session reference)",
+        )
+
     return {
         **payload,
-        "model_versions": {},
-        # model_versions is empty because upcasters cannot load external streams.
-        # A migration script (scripts/migrate_decision_v1_to_v2.py) should be
-        # run once to back-fill this field from session streams offline.
+        "model_versions": model_versions,
     }

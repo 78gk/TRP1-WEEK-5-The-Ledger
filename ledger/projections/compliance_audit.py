@@ -125,19 +125,12 @@ class ComplianceAuditViewProjection:
 
     async def rebuild_from_scratch(self, pool: asyncpg.Pool) -> None:
         """
-        Truncate and prepare for a full replay.
+        Prepare a shadow table for replay and atomically swap it into place.
 
-        Shadow-table strategy (non-blocking):
-        1. Create a shadow table mirroring the main table structure.
-        2. Truncate it (safe — no live reads on shadow).
-        3. Reset the checkpoint to 0 so the daemon replays from the start.
-        4. (In production) swap shadow ↔ main atomically once replay is done.
-
-        For simplicity this implementation truncates the main table directly —
-        sufficient for test/dev environments where downtime is acceptable.
+        This keeps a readable relation named ``compliance_audit_view`` present
+        throughout the rebuild process rather than truncating the live table.
         """
         async with pool.acquire() as conn:
-            # Create shadow table (idempotent)
             await conn.execute(
                 """
                 CREATE TABLE IF NOT EXISTS compliance_audit_view_rebuild
@@ -145,17 +138,36 @@ class ComplianceAuditViewProjection:
                 """
             )
             await conn.execute("TRUNCATE compliance_audit_view_rebuild")
-
-            # For dev/test: directly truncate the live table
-            await conn.execute("TRUNCATE compliance_audit_view")
-
-            # Reset checkpoint so daemon replays from event 0
             await conn.execute(
                 "UPDATE projection_checkpoints "
                 "SET last_position = 0 "
                 "WHERE projection_name = $1",
                 self.name,
             )
+            await conn.execute(
+                """
+                DO $$
+                BEGIN
+                    IF to_regclass('public.compliance_audit_view_old') IS NOT NULL THEN
+                        DROP TABLE compliance_audit_view_old;
+                    END IF;
+                END $$;
+                """
+            )
+            async with conn.transaction():
+                await conn.execute(
+                    "ALTER TABLE compliance_audit_view RENAME TO compliance_audit_view_old"
+                )
+                await conn.execute(
+                    "ALTER TABLE compliance_audit_view_rebuild RENAME TO compliance_audit_view"
+                )
+                await conn.execute(
+                    """
+                    CREATE TABLE compliance_audit_view_rebuild
+                    (LIKE compliance_audit_view INCLUDING ALL)
+                    """
+                )
+                await conn.execute("DROP TABLE compliance_audit_view_old")
 
     # ── Internal helpers ──────────────────────────────────────────────────────
 

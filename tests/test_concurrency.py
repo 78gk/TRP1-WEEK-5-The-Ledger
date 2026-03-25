@@ -16,6 +16,7 @@ Run with a live DB:
 """
 import asyncio
 import os
+from uuid import uuid4
 
 import asyncpg
 import pytest
@@ -85,7 +86,7 @@ async def test_concurrent_double_append_exactly_one_succeeds(event_store):
     Invariant: stream ends up with exactly 4 events (3 setup + 1 winner),
     never 5. The winning event has stream_position == 4.
     """
-    stream_id = "loan-test-concurrent-occ"
+    stream_id = f"loan-test-concurrent-occ-{uuid4()}"
 
     # ── Setup: append 3 events sequentially to reach version 2 ──────────────
     # Event 1 — creates the stream (expected_version=-1 → new stream)
@@ -170,12 +171,54 @@ async def test_concurrent_double_append_exactly_one_succeeds(event_store):
     )
 
 
+async def test_concurrent_append_race_at_expected_version_three(event_store):
+    """
+    Explicit rubric-aligned OCC race:
+    - build the stream to version 3
+    - race two appends at expected_version=3
+    - winner returns new version 4
+    - loser raises OptimisticConcurrencyError
+    """
+    stream_id = f"loan-test-concurrent-occ-v3-{uuid4()}"
+
+    version = -1
+    for _ in range(4):
+        version = await event_store.append(
+            stream_id,
+            [_make_submitted_event(stream_id)],
+            expected_version=version,
+        )
+
+    assert version == 3
+
+    results: dict[str, object | None] = {"success": None, "error": None}
+
+    async def contender() -> None:
+        try:
+            new_version = await event_store.append(
+                stream_id,
+                [_make_submitted_event(stream_id)],
+                expected_version=3,
+            )
+            if results["success"] is None:
+                results["success"] = new_version
+        except OptimisticConcurrencyError as exc:
+            results["error"] = exc
+
+    await asyncio.gather(contender(), contender())
+
+    events = await event_store.load_stream(stream_id)
+    assert len(events) == 5
+    assert results["success"] == 4
+    assert isinstance(results["error"], OptimisticConcurrencyError)
+
+
 async def test_occ_error_has_declared_fields(event_store):
     """
     OptimisticConcurrencyError exposes stream_id, expected_version, actual_version
     as inspectable attributes (not just a message string).
     """
-    stream_id = "loan-test-occ-fields"
+    stream_id = f"loan-test-occ-fields-{uuid4()}"
 
     ev = _make_submitted_event(stream_id)
     await event_store.append(stream_id, [ev], expected_version=-1)
@@ -199,7 +242,7 @@ async def test_sequential_appends_build_correct_positions(event_store):
     Non-concurrent append: each successive write returns the next version and
     stream_positions are contiguous [1, 2, 3].
     """
-    stream_id = "loan-test-sequential"
+    stream_id = f"loan-test-sequential-{uuid4()}"
 
     v1 = await event_store.append(
         stream_id, [_make_submitted_event(stream_id)], expected_version=-1

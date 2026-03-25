@@ -24,11 +24,16 @@ from ledger.schema.events import (
     AgentSessionStarted,
     AgentType,
     ApplicationSubmitted,
+    ComplianceCheckCompleted,
+    ComplianceCheckRequested,
     ComplianceRuleFailed,
     ComplianceRulePassed,
+    ComplianceVerdict,
+    CreditAnalysisRequested,
     CreditAnalysisCompleted,
     CreditDecision,
     DecisionGenerated,
+    DecisionRequested,
     FraudScreeningCompleted,
     HumanReviewCompleted,
     ApplicationApproved,
@@ -39,6 +44,13 @@ from ledger.schema.events import (
 from ledger.domain.aggregates.loan_application import LoanApplicationAggregate
 from ledger.domain.aggregates.agent_session import AgentSessionAggregate
 from ledger.domain.aggregates.compliance_record import ComplianceRecordAggregate
+
+
+def _parse_session_reference(session_ref: str) -> tuple[str, str]:
+    parts = session_ref.split("-", 2)
+    if len(parts) != 3 or parts[0] != "agent":
+        raise DomainError(f"Invalid contributing session reference: {session_ref!r}")
+    return parts[1], parts[2]
 
 
 # ─── HANDLER 1: Submit Application ───────────────────────────────────────────
@@ -78,6 +90,35 @@ async def handle_submit_application(
         stream_id=f"loan-{application_id}",
         events=[event],
         expected_version=-1,  # -1 because this is a new stream creation
+        correlation_id=correlation_id,
+        causation_id=causation_id,
+    )
+
+
+# ─── HANDLER 2: Credit Analysis Completed ────────────────────────────────────
+
+async def handle_request_credit_analysis(
+    event_store: EventStore,
+    application_id: str,
+    requested_by: str = "system",
+    priority: str = "NORMAL",
+    correlation_id: str | None = None,
+    causation_id: str | None = None,
+) -> int:
+    app = await LoanApplicationAggregate.load(event_store, application_id)
+    app.assert_state("SUBMITTED")
+
+    event = CreditAnalysisRequested(
+        application_id=application_id,
+        requested_at=datetime.utcnow(),
+        requested_by=requested_by,
+        priority=priority,
+    )
+
+    return await event_store.append(
+        stream_id=f"loan-{application_id}",
+        events=[event],
+        expected_version=app.version,
         correlation_id=correlation_id,
         causation_id=causation_id,
     )
@@ -146,6 +187,38 @@ async def handle_credit_analysis_completed(
     )
 
 
+# ─── HANDLER 2B: Request Compliance Review ───────────────────────────────────
+
+async def handle_request_compliance_review(
+    event_store: EventStore,
+    application_id: str,
+    regulation_set_version: str,
+    rules_to_evaluate: list[str],
+    triggered_by_event_id: str = "system",
+    correlation_id: str | None = None,
+    causation_id: str | None = None,
+) -> int:
+    app = await LoanApplicationAggregate.load(event_store, application_id)
+    fraud_events = await event_store.load_stream(f"fraud-{application_id}")
+    app.assert_ready_for_compliance_review(fraud_screening_completed=bool(fraud_events))
+
+    event = ComplianceCheckRequested(
+        application_id=application_id,
+        requested_at=datetime.utcnow(),
+        triggered_by_event_id=triggered_by_event_id,
+        regulation_set_version=regulation_set_version,
+        rules_to_evaluate=rules_to_evaluate,
+    )
+
+    return await event_store.append(
+        stream_id=f"loan-{application_id}",
+        events=[event],
+        expected_version=app.version,
+        correlation_id=correlation_id,
+        causation_id=causation_id,
+    )
+
+
 # ─── HANDLER 3: Fraud Screening Completed ────────────────────────────────────
 
 async def handle_fraud_screening_completed(
@@ -174,7 +247,7 @@ async def handle_fraud_screening_completed(
     agent = await AgentSessionAggregate.load(event_store, agent_id, session_id)
 
     # Step 2: Guards — delegated entirely to aggregates
-    app.assert_state("ANALYSIS_COMPLETE")
+    app.assert_ready_for_fraud_screening()
     agent.assert_context_loaded()
 
     # Step 3: Construct event (no DB calls)
@@ -191,10 +264,11 @@ async def handle_fraud_screening_completed(
     )
 
     # Step 4: Append with expected version from loaded aggregate
+    fraud_version = await event_store.stream_version(f"fraud-{application_id}")
     return await event_store.append(
         stream_id=f"fraud-{application_id}",
         events=[event],
-        expected_version=app.version,
+        expected_version=fraud_version,
         correlation_id=correlation_id,
         causation_id=causation_id,
     )
@@ -234,6 +308,7 @@ async def handle_compliance_check(
 
     # Step 2: Guard — application must be in compliance review phase
     app.assert_state("COMPLIANCE_REVIEW")
+    compliance_agg.assert_rule_is_expected(rule_id)
 
     # Step 3: Construct the appropriate event (no DB calls)
     if passed:
@@ -267,6 +342,78 @@ async def handle_compliance_check(
         stream_id=f"compliance-{application_id}",
         events=[event],
         expected_version=compliance_agg.version,
+        correlation_id=correlation_id,
+        causation_id=causation_id,
+    )
+
+
+# ─── HANDLER 4B: Complete Compliance Review ──────────────────────────────────
+
+async def handle_complete_compliance_review(
+    event_store: EventStore,
+    application_id: str,
+    session_id: str,
+    correlation_id: str | None = None,
+    causation_id: str | None = None,
+) -> int:
+    compliance_agg = await ComplianceRecordAggregate.load(event_store, application_id)
+    compliance_agg.assert_all_mandatory_checks_complete()
+
+    passed = len(compliance_agg.checks_passed)
+    failed = len(compliance_agg.checks_failed)
+    noted = len(compliance_agg.checks_noted)
+    overall_verdict = (
+        ComplianceVerdict.BLOCKED
+        if compliance_agg.has_hard_block
+        else ComplianceVerdict.CLEAR
+    )
+
+    event = ComplianceCheckCompleted(
+        application_id=application_id,
+        session_id=session_id,
+        rules_evaluated=passed + failed + noted,
+        rules_passed=passed,
+        rules_failed=failed,
+        rules_noted=noted,
+        has_hard_block=compliance_agg.has_hard_block,
+        overall_verdict=overall_verdict,
+        completed_at=datetime.utcnow(),
+    )
+
+    return await event_store.append(
+        stream_id=f"compliance-{application_id}",
+        events=[event],
+        expected_version=compliance_agg.version,
+        correlation_id=correlation_id,
+        causation_id=causation_id,
+    )
+
+
+# ─── HANDLER 4C: Request Decision ────────────────────────────────────────────
+
+async def handle_request_decision(
+    event_store: EventStore,
+    application_id: str,
+    triggered_by_event_id: str = "system",
+    correlation_id: str | None = None,
+    causation_id: str | None = None,
+) -> int:
+    app = await LoanApplicationAggregate.load(event_store, application_id)
+    compliance_agg = await ComplianceRecordAggregate.load(event_store, application_id)
+
+    app.assert_ready_to_request_decision(compliance_agg)
+
+    event = DecisionRequested(
+        application_id=application_id,
+        requested_at=datetime.utcnow(),
+        all_analyses_complete=True,
+        triggered_by_event_id=triggered_by_event_id,
+    )
+
+    return await event_store.append(
+        stream_id=f"loan-{application_id}",
+        events=[event],
+        expected_version=app.version,
         correlation_id=correlation_id,
         causation_id=causation_id,
     )
@@ -309,30 +456,17 @@ async def handle_generate_decision(
     # Rule 4: confidence threshold and recommendation consistency
     app.assert_valid_orchestrator_decision(recommendation, confidence)
 
-    # Rule 5: No hard compliance block unless declining
-    if compliance_agg.has_hard_block and recommendation.upper() != "DECLINE":
-        compliance_agg.assert_no_hard_block()
+    # Rule 5: compliance dependency and hard-block behavior
+    compliance_agg.assert_decision_allowed(recommendation)
 
     # Rule 6: Validate that each contributing session stream exists and contains
-    #         at least one event (i.e., the session actually ran for this application)
+    #         a valid decision-session causal chain for this application.
+    sessions: list[AgentSessionAggregate] = []
     for session_ref in contributing_sessions:
-        # session_ref format: "agent-{agent_type}-{session_id}"
-        session_events = await event_store.load_stream(session_ref)
-        if not session_events:
-            from ledger.schema.events import DomainError
-            raise DomainError(
-                f"Contributing session stream {session_ref!r} does not exist or "
-                f"is empty. Cannot reference an unstarted session in a decision."
-            )
-        # Verify the session was for THIS application_id
-        first_payload = session_events[0].payload if session_events else {}
-        session_app_id = first_payload.get("application_id")
-        if session_app_id and session_app_id != application_id:
-            from ledger.schema.events import DomainError
-            raise DomainError(
-                f"Contributing session {session_ref!r} belongs to application "
-                f"{session_app_id!r}, not {application_id!r}."
-            )
+        agent_type, session_id = _parse_session_reference(session_ref)
+        session = await AgentSessionAggregate.load(event_store, agent_type, session_id)
+        sessions.append(session)
+    app.assert_valid_contributing_sessions(application_id, sessions)
 
     # Step 3: Construct event (no DB calls)
     event = DecisionGenerated(

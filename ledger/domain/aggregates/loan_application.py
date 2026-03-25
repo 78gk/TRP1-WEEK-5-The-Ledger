@@ -1,24 +1,24 @@
 """
 ledger/domain/aggregates/loan_application.py
 =============================================
-COMPLETION STATUS: STUB — implement apply() for each event, enforce business rules.
+LoanApplicationAggregate is the authoritative state machine for the primary
+loan stream. It rebuilds state from event replay and exposes guard methods used
+by command handlers.
 
-The aggregate replays its event stream to rebuild state.
-Command handlers validate against current state before appending events.
-
-BUSINESS RULES TO ENFORCE:
-  1. State machine: only valid transitions allowed
-  2. DocumentFactsExtracted must exist before CreditAnalysisCompleted
-  3. All 6 compliance rules must complete before DecisionGenerated (unless hard block)
-  4. confidence < 0.60 → recommendation must be REFER (enforced here, not in LLM)
-  5. Compliance BLOCKED → only DECLINE allowed, not APPROVE or REFER
-  6. Causal chain: every agent event must reference a triggering event_id
-
-See: Section 4 of challenge document for full rule specifications.
+Business rules enforced through aggregate methods:
+  1. state-machine transitions
+  2. credit-analysis precondition before completion
+  3. fraud screening before compliance review
+  4. confidence < 0.60 forces REFER
+  5. compliance completion before decision request/generation
+  6. contributing session causal-chain validation for decisions
 """
 from __future__ import annotations
 from dataclasses import dataclass, field
 from enum import Enum
+
+from ledger.domain.aggregates.agent_session import AgentSessionAggregate
+from ledger.domain.aggregates.compliance_record import ComplianceRecordAggregate
 
 class ApplicationState(str, Enum):
     NEW = "NEW"
@@ -60,6 +60,9 @@ class LoanApplicationAggregate:
     loan_purpose: str | None = None
     credit_risk_tier: str | None = None
     credit_confidence: float | None = None
+    fraud_screening_completed: bool = False
+    compliance_requested: bool = False
+    decision_requested: bool = False
     version: int = 0  # Mirrors the stream's current_version
 
     @classmethod
@@ -121,10 +124,18 @@ class LoanApplicationAggregate:
                 self.credit_risk_tier = getattr(decision, "risk_tier", None)
                 self.credit_confidence = getattr(decision, "confidence", None)
 
+    def _on_FraudScreeningCompleted(self, event: StoredEvent) -> None:
+        self.fraud_screening_completed = True
+
     def _on_ComplianceCheckRequested(self, event: StoredEvent) -> None:
+        self.compliance_requested = True
         self._transition(ApplicationState.COMPLIANCE_REVIEW)
 
+    def _on_ComplianceCheckCompleted(self, event: StoredEvent) -> None:
+        self.compliance_requested = True
+
     def _on_DecisionRequested(self, event: StoredEvent) -> None:
+        self.decision_requested = True
         self._transition(ApplicationState.PENDING_DECISION)
 
     def _on_DecisionGenerated(self, event: StoredEvent) -> None:
@@ -179,7 +190,7 @@ class LoanApplicationAggregate:
         Enforce Rule 4: confidence < 0.60 → recommendation must be REFER.
         Raised during the command handler Phase before DecisionGenerated is emitted.
         """
-        if confidence < 0.60 and recommendation.upper() == "APPROVE":
+        if confidence < 0.60 and recommendation.upper() != "REFER":
             raise DomainError(
                 f"Cannot approve application: confidence {confidence:.2f} is below 0.60 threshold. "
                 f"Recommendation must be REFER."
@@ -200,3 +211,43 @@ class LoanApplicationAggregate:
             raise DomainError(
                 f"Application must be awaiting human review (currently {self.state.name})"
             )
+
+    def assert_ready_for_fraud_screening(self) -> None:
+        if self.state != ApplicationState.ANALYSIS_COMPLETE:
+            raise DomainError(
+                f"Application must be in ANALYSIS_COMPLETE before fraud screening "
+                f"(currently {self.state.name})"
+            )
+
+    def assert_ready_for_compliance_review(
+        self,
+        fraud_screening_completed: bool | None = None,
+    ) -> None:
+        if self.state != ApplicationState.ANALYSIS_COMPLETE:
+            raise DomainError(
+                f"Application must still be in ANALYSIS_COMPLETE before compliance review "
+                f"(currently {self.state.name})"
+            )
+        fraud_done = self.fraud_screening_completed if fraud_screening_completed is None else fraud_screening_completed
+        if not fraud_done:
+            raise DomainError(
+                "Fraud screening must complete before compliance review can begin."
+            )
+
+    def assert_ready_to_request_decision(self, compliance: ComplianceRecordAggregate) -> None:
+        if self.state != ApplicationState.COMPLIANCE_REVIEW:
+            raise DomainError(
+                f"Application must be in COMPLIANCE_REVIEW before decision request "
+                f"(currently {self.state.name})"
+            )
+        compliance.assert_all_mandatory_checks_complete()
+
+    def assert_valid_contributing_sessions(
+        self,
+        application_id: str,
+        sessions: list[AgentSessionAggregate],
+    ) -> None:
+        if not sessions:
+            raise DomainError("At least one contributing agent session is required.")
+        for session in sessions:
+            session.assert_referenced_for_decision(application_id)
